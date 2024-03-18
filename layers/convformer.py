@@ -1,99 +1,86 @@
-import torch
-from torch import nn
-import numpy as np
-import torch
-import math
-from torch.nn import Module, Sequential, Conv2d, ReLU,AdaptiveMaxPool2d, AdaptiveAvgPool2d, \
-    NLLLoss, BCELoss, CrossEntropyLoss, AvgPool2d, MaxPool2d, Parameter, Linear, Sigmoid, Softmax, Dropout, Embedding
-from torch.nn import functional as F
-from torch.autograd import Variable
+import tensorflow as tf
+from keras.layers import GlobalAveragePooling2D, GlobalMaxPooling2D, Reshape, Dense, multiply, Permute, Concatenate, Conv2D, Add, Activation, Lambda
+from keras import backend as K
+from keras.activations import sigmoid
 
-import torch
-from torch import nn
-import numpy as np
-import torch
-import math
-from torch.nn import Module, Sequential, Conv2d, ReLU,AdaptiveMaxPool2d, AdaptiveAvgPool2d, \
-    NLLLoss, BCELoss, CrossEntropyLoss, AvgPool2d, MaxPool2d, Parameter, Linear, Sigmoid, Softmax, Dropout, Embedding
-from torch.nn import functional as F
-from torch.autograd import Variable
+# can change ratio here to optimize it further
+def cbam_block(cbam_feature, ratio=8):
+	"""Contains the implementation of Convolutional Block Attention Module(CBAM) block.
+	As described in https://arxiv.org/abs/1807.06521.
+	"""
+	
+	cbam_feature = channel_attention(cbam_feature, ratio)
+	cbam_feature = spatial_attention(cbam_feature)
+	return cbam_feature
 
-from os.path import join as pjoin
-from collections import OrderedDict
+def channel_attention(input_feature, ratio=8):
+	
+	channel_axis = 1 if K.image_data_format() == "channels_first" else -1
+	channel = input_feature._keras_shape[channel_axis]
+	
+	shared_layer_one = Dense(channel//ratio,
+							 activation='relu',
+							 kernel_initializer='he_normal',
+							 use_bias=True,
+							 bias_initializer='zeros')
+	shared_layer_two = Dense(channel,
+							 kernel_initializer='he_normal',
+							 use_bias=True,
+							 bias_initializer='zeros')
+	
+	avg_pool = GlobalAveragePooling2D()(input_feature)    
+	avg_pool = Reshape((1,1,channel))(avg_pool)
+	assert avg_pool._keras_shape[1:] == (1,1,channel)
+	avg_pool = shared_layer_one(avg_pool)
+	assert avg_pool._keras_shape[1:] == (1,1,channel//ratio)
+	avg_pool = shared_layer_two(avg_pool)
+	assert avg_pool._keras_shape[1:] == (1,1,channel)
+	
+	max_pool = GlobalMaxPooling2D()(input_feature)
+	max_pool = Reshape((1,1,channel))(max_pool)
+	assert max_pool._keras_shape[1:] == (1,1,channel)
+	max_pool = shared_layer_one(max_pool)
+	assert max_pool._keras_shape[1:] == (1,1,channel//ratio)
+	max_pool = shared_layer_two(max_pool)
+	assert max_pool._keras_shape[1:] == (1,1,channel)
+	
+	cbam_feature = Add()([avg_pool,max_pool])
+	cbam_feature = Activation('sigmoid')(cbam_feature)
+	
+	if K.image_data_format() == "channels_first":
+		cbam_feature = Permute((3, 1, 2))(cbam_feature)
+	
+	return multiply([input_feature, cbam_feature])
 
-import torch.nn.functional as F
-
-from torch.nn import Module, Sequential, Conv2d, ReLU,AdaptiveMaxPool2d, AdaptiveAvgPool2d, \
-    NLLLoss, BCELoss, CrossEntropyLoss, AvgPool2d, MaxPool2d, Parameter, Linear, Sigmoid, Softmax, Dropout, Embedding
-from torch.nn import functional as F
-from torch.autograd import Variable
-
-class PAM_Module(Module):
-    """ Position attention module"""
-    #Ref from SAGAN
-    def __init__(self, in_dim):
-        super(PAM_Module, self).__init__()
-        self.chanel_in = in_dim
-
-        self.query_conv = Conv2d(in_channels=in_dim, out_channels=in_dim//8, kernel_size=1)
-        self.key_conv = Conv2d(in_channels=in_dim, out_channels=in_dim//8, kernel_size=1)
-        self.value_conv = Conv2d(in_channels=in_dim, out_channels=in_dim, kernel_size=1)
-        self.gamma = Parameter(torch.zeros(1))
-
-        self.softmax = Softmax(dim=-1)
-    def call(self, x):
-        """
-            inputs :
-                x : input feature maps( B X C X H X W)
-            returns :
-                out : attention value + input feature
-                attention: B X (HxW) X (HxW)
-        """
-        m_batchsize, C,height, width = x.size()
-        proj_query = self.query_conv(x).view(m_batchsize, -1, width*height).permute(0, 2, 1)
-        proj_key = self.key_conv(x).view(m_batchsize, -1, width*height)
-        energy = torch.bmm(proj_query, proj_key)
-        attention = self.softmax(energy)
-        proj_value = self.value_conv(x).view(m_batchsize, -1, width*height)
-
-        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
-        out = out.view(m_batchsize, C, height, width)
-
-        out = self.gamma*out + x
-        return out
-
-class CAM_Module(Module):
-    """ Channel attention module"""
-    def __init__(self, in_dim):
-        super(CAM_Module, self).__init__()
-        self.chanel_in = in_dim
-
-
-        self.gamma = Parameter(torch.zeros(1))
-        self.softmax  = Softmax(dim=-1)
-    def call(self,x):
-        """
-            inputs :
-                x : input feature maps( B X C X H X W)
-            returns :
-                out : attention value + input feature
-                attention: B X C X C
-        """
-        m_batchsize, C, height, width = x.size()
-        proj_query = x.view(m_batchsize, C, -1)
-        proj_key = x.view(m_batchsize, C, -1).permute(0, 2, 1)
-        energy = torch.bmm(proj_query, proj_key)
-        energy_new = torch.max(energy, -1, keepdim=True)[0].expand_as(energy)-energy
-        attention = self.softmax(energy_new)
-        proj_value = x.view(m_batchsize, C, -1)
-
-        out = torch.bmm(attention, proj_value)
-        out = out.view(m_batchsize, C, height, width)
-
-        out = self.gamma*out + x
-        return out
-
-
+def spatial_attention(input_feature):
+	kernel_size = 7
+	
+	if K.image_data_format() == "channels_first":
+		channel = input_feature._keras_shape[1]
+		cbam_feature = Permute((2,3,1))(input_feature)
+	else:
+		channel = input_feature._keras_shape[-1]
+		cbam_feature = input_feature
+	
+	avg_pool = Lambda(lambda x: K.mean(x, axis=3, keepdims=True))(cbam_feature)
+	assert avg_pool._keras_shape[-1] == 1
+	max_pool = Lambda(lambda x: K.max(x, axis=3, keepdims=True))(cbam_feature)
+	assert max_pool._keras_shape[-1] == 1
+	concat = Concatenate(axis=3)([avg_pool, max_pool])
+	assert concat._keras_shape[-1] == 2
+	cbam_feature = Conv2D(filters = 1,
+					kernel_size=kernel_size,
+					strides=1,
+					padding='same',
+					activation='sigmoid',
+					kernel_initializer='he_normal',
+					use_bias=False)(concat)	
+	assert cbam_feature._keras_shape[-1] == 1
+	
+	if K.image_data_format() == "channels_first":
+		cbam_feature = Permute((3, 1, 2))(cbam_feature)
+		
+	return multiply([input_feature, cbam_feature])
 
 def convformer(input_tensor, filters, padding = "same"):
     
@@ -104,10 +91,8 @@ def convformer(input_tensor, filters, padding = "same"):
     # x = tf.keras.layers.Attention()([x, x, x])
     # out = tf.keras.layers.Add()([x, input_tensor])
 
-    # to use dual attention: channel attention, position attention
-    pam = PAM_Module(filters)(x)
-    cam = CAM_Module(filters)(x)
-    dual_attention = tf.keras.layers.Add()([pam, cam])
+    # to use dual attention: channel attention, spatial attention
+    cbam = cbam_block(x)
     out = tf.keras.layers.Add()([dual_attention, input_tensor])
 
     # to use multiheadattention
